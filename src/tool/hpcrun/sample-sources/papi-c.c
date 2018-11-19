@@ -87,6 +87,7 @@
 #include <hpcrun/sample_event.h>
 #include <hpcrun/thread_data.h>
 #include <hpcrun/threadmgr.h>
+#include <hpcrun/cct/cct.h>
 
 #include <sample-sources/blame-shift/blame-shift.h>
 #include <utilities/tokenize.h>
@@ -94,7 +95,28 @@
 #include <lush/lush-backtrace.h>
 #include <lib/prof-lean/hpcrun-fmt.h>
 
+#include "htm_tsx.h"
+#include "shadowmemory.h"
 
+
+/* TRANSACTION CODES for analyzing the abort causes */
+enum {
+        PERF_TXN_ELISION        = (1 << 0), /* From elision */
+        PERF_TXN_TRANSACTION    = (1 << 1), /* From transaction */
+        PERF_TXN_SYNC           = (1 << 2), /* Instruction is related */
+        PERF_TXN_ASYNC          = (1 << 3), /* Instruction not related */
+        PERF_TXN_RETRY          = (1 << 4), /* Retry possible */
+        PERF_TXN_CONFLICT       = (1 << 5), /* Conflict abort */
+        PERF_TXN_CAPACITY_WRITE = (1 << 6), /* Capacity write abort */
+        PERF_TXN_CAPACITY_READ  = (1 << 7), /* Capacity read abort */
+
+        PERF_TXN_MAX            = (1 << 8), /* non-ABI */
+
+        /* bits 32..63 are reserved for the abort code */
+
+        PERF_TXN_ABORT_MASK  = (0xffffffffULL << 32),
+        PERF_TXN_ABORT_SHIFT = 32,
+};
 
 /******************************************************************************
  * macros
@@ -107,9 +129,11 @@
 #include "papi-c.h"
 
 /******************************************************************************
- * forward declarations 
+ * forward declarations
  *****************************************************************************/
-static void papi_event_handler(int event_set, void *pc, long long ovec, void *context);
+static void
+papi_event_handler(int event_set, void *pc, sample_data_t sample_data,
+        long long ovec, void *context);
 static int  event_is_derived(int ev_code);
 static void event_fatal_error(int ev_code, int papi_ret);
 
@@ -129,8 +153,54 @@ static int papi_unavail = 0;
 //
 static bool disable_papi_cuda = false;
 
+
+//When the corresponding bit is set, we know what we are trying to sample
+//Bit 0: cycle
+//Bit 1: rtm-abort
+//Bit 2: memory operation
+#define SAMPLING_MODE_BIT_CYCLE 0
+#define SAMPLING_MODE_BIT_RTM_ABORT 1
+#define SAMPLING_MODE_BIT_MEM_LOAD 2
+#define SAMPLING_MODE_BIT_MEM_STORE 3
+
+static unsigned sampling_mode = 0;
+static int sampling_event_codes[4] = {0,0,0,0};
+
+//HTM Metrics
+typedef struct HTM_METRIC_ABORT_T {
+  int weight_metric_id;
+  int conflict_metric_id;
+  int conflict_weight_metric_id;
+  int capacity_read_metric_id;
+  int capacity_read_weight_metric_id;
+  int capacity_write_metric_id;
+  int capacity_write_weight_metric_id;
+  int sync_metric_id;
+  int sync_weight_metric_id;
+  int async_metric_id;
+  int async_weight_metric_id;
+} HTM_METRIC_ABORT_T;
+static HTM_METRIC_ABORT_T htm_metric_abort = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+
+typedef struct HTM_METRIC_CYC_T {
+  int in_htm_metric_id;
+  int in_fallback_metric_id;
+  int in_lockwaiting_metric_id;
+  int in_other_metric_id;
+} HTM_METRIC_CYC_T;
+static HTM_METRIC_CYC_T htm_metric_cyc = {-1,-1,-1,-1};
+
+typedef struct HTM_METRIC_MEM_T {
+  int false_sharing_id;
+  int load_metric_id;
+  int store_metric_id;
+} HTM_METRIC_MEM_T;
+static HTM_METRIC_MEM_T htm_metric_mem = {0,0,0};
+
+// threshold
+static int threshold_g[4] = {1,1,1,1};
 /******************************************************************************
- * private operations 
+ * private operations
  *****************************************************************************/
 
 static int
@@ -148,7 +218,7 @@ get_event_index(sample_source_t *self, int event_code)
 //
 // fetch a given component's event set. Create one if need be
 //
-int 
+int
 get_component_event_set(papi_source_info_t* psi, int cidx)
 {
    if (cidx < 0 || cidx >= psi->num_components) {
@@ -185,23 +255,23 @@ thread_count_scaling_for_component(int cidx)
 
 //-----------------------------------------------------------
 // function print_desc
-//   wrap lines for native event descriptions to contain 
+//   wrap lines for native event descriptions to contain
 //   four white space followed by BUFLEN characters
 //-----------------------------------------------------------
-static void 
+static void
 print_desc(char *s)
 {
-#define BUFLEN 68 
+#define BUFLEN 68
   char buffer[BUFLEN];
   char *s_end = s + strlen(s);
   while (s < s_end) {
     int i;
     char *cur = s;
-           
+
     //-------------------------------------------------
     // peel off at most the next BUFLEN characters from
-    // the string. break the text at last white 
-    // space if a word will extend beyond the boundary. 
+    // the string. break the text at last white
+    // space if a word will extend beyond the boundary.
     //-------------------------------------------------
     int last_blank = BUFLEN-1;
     for(i=0;i<BUFLEN; i++) {
@@ -210,7 +280,7 @@ print_desc(char *s)
 	// remember last white space
 	last_blank = i;
       }
-      if (*cur == '\n'|| *cur == 0) { 
+      if (*cur == '\n'|| *cur == 0) {
 	// break at newline or end of string
 	last_blank = i;
 	break;
@@ -331,8 +401,8 @@ METHOD_FN(start)
   int cidx;
   TMSG(PAPI, "start");
 
-  if (papi_unavail) { 
-    return; 
+  if (papi_unavail) {
+    return;
   }
 
   thread_data_t* td = hpcrun_get_thread_data();
@@ -364,7 +434,7 @@ METHOD_FN(start)
 	  EMSG("PAPI returned EISRUN for event set %d component %d", ci->eventSet, cidx);
 	}
 	else if (ret != PAPI_OK) {
-	  EMSG("PAPI_start failed with %s (%d) for event set %d component %d ", 
+	  EMSG("PAPI_start failed with %s (%d) for event set %d component %d ",
 	       PAPI_strerror(ret), ret, ci->eventSet, cidx);
 	  hpcrun_ssfail_start("PAPI");
 	}
@@ -372,7 +442,7 @@ METHOD_FN(start)
 	if (ci->some_derived) {
 	  ret = PAPI_read(ci->eventSet, ci->prev_values);
 	  if (ret != PAPI_OK) {
-	    EMSG("PAPI_read of event set %d for component %d failed with %s (%d)", 
+	    EMSG("PAPI_read of event set %d for component %d failed with %s (%d)",
 		 ci->eventSet, cidx, PAPI_strerror(ret), ret);
 	  }
 	}
@@ -463,7 +533,7 @@ METHOD_FN(supports_event, const char *ev_str)
   if (self->state == UNINIT){
     METHOD_CALL(self, init);
   }
-  
+
   char evtmp[1024];
   int ec;
   long th;
@@ -471,7 +541,7 @@ METHOD_FN(supports_event, const char *ev_str)
   hpcrun_extract_ev_thresh(ev_str, sizeof(evtmp), evtmp, &th, DEFAULT_THRESHOLD);
   return PAPI_event_name_to_code(evtmp, &ec) == PAPI_OK;
 }
- 
+
 static void
 METHOD_FN(process_event_list, int lush_metrics)
 {
@@ -567,6 +637,39 @@ METHOD_FN(process_event_list, int lush_metrics)
 				      MetricFlags_ValFmt_Int,
 				      threshold, prop);
 
+    //threshold_g = threshold;
+
+    // record PEBS rtm metric id for future usage
+    if (strcmp(buffer, "RTM_RETIRED:ABORTED") == 0) {
+      sampling_event_codes[SAMPLING_MODE_BIT_RTM_ABORT] = self->evl.events[i].event;
+      //printf("RTM_RETIRED:ABORTED %d\n", sampling_event_codes[SAMPLING_MODE_BIT_RTM_ABORT]);//jqswang
+      threshold_g[SAMPLING_MODE_BIT_RTM_ABORT] = threshold;
+      sampling_mode |= 2;
+    }
+    if (strcmp(buffer, "PAPI_TOT_CYC") == 0 || strncmp(buffer, "cycles", 6) == 0){
+      sampling_event_codes[SAMPLING_MODE_BIT_CYCLE] = self->evl.events[i].event;
+      //printf("PAPI_TOT_CYC %d\n", sampling_event_codes[SAMPLING_MODE_BIT_CYCLE]);//jqswang
+      threshold_g[SAMPLING_MODE_BIT_CYCLE] = threshold;
+      sampling_mode |= 1;
+    }
+    if (strcmp(buffer, "MEM_UOPS_RETIRED:ALL_STORES") == 0) {
+      htm_metric_mem.store_metric_id = metric_id;
+      sampling_event_codes[SAMPLING_MODE_BIT_MEM_STORE] = self->evl.events[i].event;
+      //printf("MEM_UOPS_RETIRED:ALL_STORES %d\n", sampling_event_codes[SAMPLING_MODE_BIT_MEM_STORE]);//jqswang
+      threshold_g[SAMPLING_MODE_BIT_MEM_STORE] = threshold;
+      sampling_mode |= (1U << SAMPLING_MODE_BIT_MEM_STORE);
+    }
+    if (strcmp(buffer, "MEM_UOPS_RETIRED:ALL_LOADS") == 0 ){
+      htm_metric_mem.load_metric_id = metric_id;
+      sampling_event_codes[SAMPLING_MODE_BIT_MEM_LOAD] = self->evl.events[i].event;
+      //printf("MEM_UOPS_RETIRED:ALL_LOADS %d\n", sampling_event_codes[SAMPLING_MODE_BIT_MEM_LOAD]);//jqswang
+      threshold_g[SAMPLING_MODE_BIT_MEM_LOAD] = threshold;
+      sampling_mode |= (1U << SAMPLING_MODE_BIT_MEM_LOAD);
+    }
+    //if (strcmp(buffer, "RTM_RETIRED:COMMIT") == 0 ){
+      //printf("RTM_RETIRED:COMMIT %d\n", self->evl.events[i].event);//jqswang
+    //}
+
     // FIXME:LUSH: need a more flexible metric interface
     if (num_lush_metrics > 0 && strcmp(buffer, "PAPI_TOT_CYC") == 0) {
       // there should be one lush metric; its source is the last event
@@ -581,6 +684,80 @@ METHOD_FN(process_event_list, int lush_metrics)
     }
   }
 
+  if (((sampling_mode >> SAMPLING_MODE_BIT_MEM_STORE) & 1U ) == 1
+  || ((sampling_mode >> SAMPLING_MODE_BIT_MEM_LOAD) & 1U ) == 1)
+  {
+    htm_metric_mem.false_sharing_id = hpcrun_new_metric();
+    hpcrun_set_metric_info_and_period(htm_metric_mem.false_sharing_id, "FALSE_SHARING",
+                MetricFlags_ValFmt_Int,
+                1, metric_property_none);
+  }
+  // create new metric slot
+  if ((sampling_mode & 2 ) == 2){
+    htm_metric_abort.weight_metric_id = hpcrun_new_metric(); // the latency of the transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.weight_metric_id, "HTM_WEIGHT",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.conflict_metric_id = hpcrun_new_metric(); // #conflict of the transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.conflict_metric_id, "HTM_CONFLICT",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.conflict_weight_metric_id = hpcrun_new_metric(); // the latency of conflict transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.conflict_weight_metric_id, "HTM_CONFLICT_WEIGHT",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.capacity_read_metric_id = hpcrun_new_metric(); // #capacity read of the transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.capacity_read_metric_id, "HTM_CAPACITY_READ",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.capacity_read_weight_metric_id = hpcrun_new_metric(); // the latency of the capacity read transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.capacity_read_weight_metric_id, "HTM_CAPACITY_READ_WEIGHT",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.capacity_write_metric_id = hpcrun_new_metric(); // #capacity write of the transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.capacity_write_metric_id, "HTM_CAPACITY_WRITE",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.capacity_write_weight_metric_id = hpcrun_new_metric(); // the latency of capacity write transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.capacity_write_weight_metric_id, "HTM_CAPACITY_WRITE_WEIGHT",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.sync_metric_id = hpcrun_new_metric(); // the latency of capacity write transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.sync_metric_id, "HTM_SYNC",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.sync_weight_metric_id = hpcrun_new_metric(); // the latency of capacity write transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.sync_weight_metric_id, "HTM_SYNC_WEIGHT",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.async_metric_id = hpcrun_new_metric(); // the latency of capacity write transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.async_metric_id, "HTM_ASYNC",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+    htm_metric_abort.async_weight_metric_id = hpcrun_new_metric(); // the latency of capacity write transaction
+    hpcrun_set_metric_info_and_period(htm_metric_abort.async_weight_metric_id, "HTM_ASYNC_WEIGHT",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_RTM_ABORT], metric_property_none);
+  }
+  if ((sampling_mode & 1) == 1){
+    htm_metric_cyc.in_htm_metric_id = hpcrun_new_metric();
+    hpcrun_set_metric_info_and_period(htm_metric_cyc.in_htm_metric_id, "TIME_IN_HTM",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_CYCLE], metric_property_none);
+    htm_metric_cyc.in_fallback_metric_id = hpcrun_new_metric();
+    hpcrun_set_metric_info_and_period(htm_metric_cyc.in_fallback_metric_id, "TIME_IN_FALLBACK",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_CYCLE], metric_property_none);
+    htm_metric_cyc.in_lockwaiting_metric_id = hpcrun_new_metric();
+    hpcrun_set_metric_info_and_period(htm_metric_cyc.in_lockwaiting_metric_id, "TIMEIN_LOCK_WAITING",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_CYCLE], metric_property_none);
+
+    htm_metric_cyc.in_other_metric_id = hpcrun_new_metric();
+    hpcrun_set_metric_info_and_period(htm_metric_cyc.in_other_metric_id, "TIMEIN_OTHER_TX",
+  				    MetricFlags_ValFmt_Int,
+  				    threshold_g[SAMPLING_MODE_BIT_CYCLE], metric_property_none);
+  }
   if (! some_overflow) {
     hpcrun_ssfail_all_derived("PAPI");
   }
@@ -597,7 +774,7 @@ METHOD_FN(gen_event_set, int lush_metrics)
   if (papi_unavail) { return; }
 
   int num_components = PAPI_num_components();
-  int ss_info_size = sizeof(papi_source_info_t) + 
+  int ss_info_size = sizeof(papi_source_info_t) +
     num_components * sizeof(papi_component_info_t);
 
   TMSG(PAPI, "Num components = %d", num_components);
@@ -610,7 +787,7 @@ METHOD_FN(gen_event_set, int lush_metrics)
   psi->num_components = num_components;
   for (i = 0; i < num_components; i++) {
     papi_component_info_t *ci = &(psi->component_info[i]);
-    ci->inUse = false;  
+    ci->inUse = false;
     ci->eventSet = PAPI_NULL;
     ci->state = INIT;
     ci->some_derived = 0;
@@ -633,15 +810,15 @@ METHOD_FN(gen_event_set, int lush_metrics)
   for (i = 0; i < nevents; i++) {
     int evcode = self->evl.events[i].event;
     int cidx = PAPI_get_event_component(evcode);
-    
+
     ret = component_add_event(psi, cidx, evcode);
     psi->component_info[cidx].some_derived |= event_is_derived(evcode);
     TMSG(PAPI, "Added event code %x to component %d", evcode, cidx);
     {
       char buffer[PAPI_MAX_STR_LEN];
       PAPI_event_code_to_name(evcode, buffer);
-      TMSG(PAPI, 
-	   "PAPI_add_event(eventSet=%%d, event_code=%x (event name %s)) component=%d", 
+      TMSG(PAPI,
+	   "PAPI_add_event(eventSet=%%d, event_code=%x (event name %s)) component=%d",
 	   /* eventSet, */ evcode, buffer, cidx);
     }
     if (ret != PAPI_OK) {
@@ -664,7 +841,7 @@ METHOD_FN(gen_event_set, int lush_metrics)
     long thresh = self->evl.events[i].thresh;
     int cidx = PAPI_get_event_component(evcode);
     int eventSet = get_component_event_set(psi, cidx);
-    
+
     // **** No overflow for synchronous events ****
     // **** Use component-specific setup for synchronous events ****
     if (component_uses_sync_samples(cidx)) {
@@ -678,7 +855,7 @@ METHOD_FN(gen_event_set, int lush_metrics)
     if (! derived[i]) {
       ret = PAPI_overflow(eventSet, evcode, thresh, OVERFLOW_MODE,
 			  papi_event_handler);
-      TMSG(PAPI, "PAPI_overflow(eventSet=%d, evcode=%x, thresh=%d) = %d", 
+      TMSG(PAPI, "PAPI_overflow(eventSet=%d, evcode=%x, thresh=%d) = %d",
 	   eventSet, evcode, thresh, ret);
       if (ret != PAPI_OK) {
 	EMSG("failure in PAPI gen_event_set(): PAPI_overflow() returned: %s (%d)",
@@ -735,7 +912,7 @@ METHOD_FN(display_events)
     printf("\n\n");
   }
 
-  num_components = PAPI_num_components(); 
+  num_components = PAPI_num_components();
   for(cidx = 0; cidx < num_components; cidx++) {
     const PAPI_component_info_t* component = PAPI_get_component_info(cidx);
     int cmp_event_count = 0;
@@ -747,14 +924,14 @@ METHOD_FN(display_events)
     printf("\n");
     printf("Name  Description\n");
     printf("===========================================================================\n");
-    
+
     ev = 0 | PAPI_NATIVE_MASK;
     ret = PAPI_enum_cmp_event(&ev, PAPI_ENUM_FIRST, cidx);
     while (ret == PAPI_OK) {
       memset(&info, 0, sizeof(info));
       if (PAPI_get_event_info(ev, &info) == PAPI_OK) {
 	cmp_event_count++;
-	printf("%-48s\n", info.symbol); 
+	printf("%-48s\n", info.symbol);
         print_desc(info.long_descr);
         printf("---------------------------------------------------------------------------\n");
       }
@@ -780,7 +957,7 @@ METHOD_FN(display_events)
 #include "ss_obj.h"
 
 // **************************************************************************
-// * public operations 
+// * public operations
 // **************************************************************************
 void
 hpcrun_disable_papi_cuda(void)
@@ -789,7 +966,7 @@ hpcrun_disable_papi_cuda(void)
 }
 
 /******************************************************************************
- * private operations 
+ * private operations
  *****************************************************************************/
 
 // Returns: 1 if the event code is a derived event.
@@ -832,9 +1009,40 @@ event_fatal_error(int ev_code, int papi_ret)
   hpcrun_ssfail_unsupported("PAPI", name);
 }
 
+
+// Input: lbr, bnr, current_ip (IP of the current sample)
+// Output: call_chain, an array of IPs of call instructions
+// Return: -2, no lbr
+// Return: -1, not in TX
+// Return: other non-negative integer, the number of IPs in call_chain
+static int
+get_call_chain_from_lbr(struct _perf_branch_entry *lbr, uint64_t bnr, uint64_t current_ip, uint64_t *call_chain){
+  if (bnr == 0 || bnr > 16 ) return -2; //TODO: the maximum number should be determined in the compile time
+  if (lbr[0].abort == 0) return -1; //not from HTM abort; no need to use LBR Information
+  uint64_t last_call_ip = current_ip;
+  uint32_t counter = 0;
+  for ( int i = 1 ; i < bnr; i++ ){ // i = 2,3,4,...
+    if ( lbr[i].in_tx == 0 ) break;
+    uint64_t function_start, function_end;
+    fnbounds_enclosing_addr( last_call_ip , &function_start, &function_end, NULL);
+    if ( function_start == lbr[i].to){
+      call_chain[counter++] = last_call_ip = lbr[i].from;
+    }
+  }
+  return counter;
+}
+
+void
+begin_in_tx(void)
+{
+}
+
+
+static int g_hpcrun_lock = 0; // jqswang: this lock is only used for data printing for debugging purpose
+
 static void
-papi_event_handler(int event_set, void *pc, long long ovec,
-                   void *context)
+papi_event_handler(int event_set, void *pc, sample_data_t sample_data,
+        long long ovec, void *context)
 {
   sample_source_t *self = &obj_name();
   long long values[MAX_EVENTS];
@@ -842,7 +1050,7 @@ papi_event_handler(int event_set, void *pc, long long ovec,
   int my_event_count = MAX_EVENTS;
   int nevents  = self->evl.nevents;
   int i, ret;
-
+  //printf("event_set=%d\n", event_set); //jqswang
   int my_event_codes[MAX_EVENTS];
   int my_event_codes_count = MAX_EVENTS;
 
@@ -874,11 +1082,11 @@ papi_event_handler(int event_set, void *pc, long long ovec,
     }
   }
 
-  ret = PAPI_get_overflow_event_index(event_set, ovec, my_events, 
+  ret = PAPI_get_overflow_event_index(event_set, ovec, my_events,
 				      &my_event_count);
   if (ret != PAPI_OK) {
     TMSG(PAPI_SAMPLE, "papi_event_handler: event set %d ovec %ld "
-	 "get_overflow_event_index return code = %d ==> %s", 
+	 "get_overflow_event_index return code = %d ==> %s",
 	 event_set, ovec, ret, PAPI_strerror(ret));
 #ifdef DEBUG_PAPI_OVERFLOW
     ret = PAPI_list_events(event_set, my_event_codes, &my_event_codes_count);
@@ -887,7 +1095,7 @@ papi_event_handler(int event_set, void *pc, long long ovec,
 	   "Return code = %d ==> %s", ret, PAPI_strerror(ret));
     } else {
       for (i = 0; i < my_event_codes_count; i++) {
-        TMSG(PAPI_SAMPLE, "event set %d event code %d = %x\n", 
+        TMSG(PAPI_SAMPLE, "event set %d event code %d = %x\n",
 	     event_set, i, my_event_codes[i]);
       }
     }
@@ -901,14 +1109,17 @@ papi_event_handler(int event_set, void *pc, long long ovec,
 		 "Return code = %d ==> %s", ret, PAPI_strerror(ret));
   }
 
+  // PEBS
+  td->pc = pc;
+
   for (i = 0; i < my_event_count; i++) {
     // FIXME: SUBTLE ERROR: metric_id may not be same from hpcrun_new_metric()!
     // This means lush's 'time' metric should be *last*
 
     TMSG(PAPI_SAMPLE,"handling papi overflow event: "
-	"event set %d event index = %d event code = 0x%x", 
+	"event set %d event index = %d event code = 0x%x",
 	event_set, my_events[i], my_event_codes[my_events[i]]);
-
+    //printf("event_set=%d event_code=%d\n",event_set, my_event_codes[my_events[i]]);//jqswang
     int event_index = get_event_index(self, my_event_codes[my_events[i]]);
 
     int metric_id = hpcrun_event2metric(self, event_index);
@@ -924,10 +1135,135 @@ papi_event_handler(int event_set, void *pc, long long ovec,
       metricIncrement = 1;
     }
 
-    sample_val_t sv = hpcrun_sample_callpath(context, metric_id, metricIncrement,
-			   0/*skipInner*/, 0/*isSync*/);
+    sample_val_t sv;
+
+    uint64_t call_chain[32];
+    int call_chain_number = get_call_chain_from_lbr(sample_data.lbr, sample_data.bnr, pc, call_chain);
+#if 0
+    if (call_chain_number > 0){
+        fprintf(stderr, "%lx :", (uint64_t) pc);
+    	for(int i = 0; i < call_chain_number; i++){
+       		fprintf(stderr, " %lx", call_chain[i]);
+    	}
+    	fprintf(stderr,"\n");
+    }
+#endif
+
+    if (call_chain_number > 1) {
+      sv = hpcrun_sample_callpath(context, metric_id, 0/*not log metric*/,
+        1/*skipInner*/, 0/*isSync*/);
+        // insert a marker to indicate the call is recovered from the LBR in HTM
+      sv.sample_node = hpcrun_insert_special_node(sv.sample_node, (void *)((uint64_t)begin_in_tx+1));
+      int lbrIter;
+      // insert LBR nodes, omit the last call in the lbr call chain
+      for (lbrIter = call_chain_number-2; lbrIter >=0 ; lbrIter--)
+        sv.sample_node = hpcrun_insert_special_node(sv.sample_node, (void *)(call_chain[lbrIter]+1));
+
+      // log the sampled IP and its metric
+      sv.sample_node = hpcrun_insert_special_node(sv.sample_node, pc);
+      hpcrun_cct_terminate_path(sv.sample_node);
+      cct_metric_data_increment(metric_id, sv.sample_node, (cct_metric_data_t){.i = metricIncrement});
+    }
+    else if (call_chain_number == 0 || call_chain_number == 1){
+      sv = hpcrun_sample_callpath(context, metric_id, 0/*not log metric*/,
+        1/*skipInner*/, 0/*isSync*/);
+      sv.sample_node = hpcrun_insert_special_node(sv.sample_node, (void *)((uint64_t)begin_in_tx+1));
+      // log the sampled IP and its metric
+      sv.sample_node = hpcrun_insert_special_node(sv.sample_node, pc);
+      hpcrun_cct_terminate_path(sv.sample_node);
+      cct_metric_data_increment(metric_id, sv.sample_node, (cct_metric_data_t){.i = metricIncrement});
+    }
+    else {  // less than 0 case (not in TX or 0 nbr
+      // just record the sample and not distinguish whether the sample is in HTM or not
+      sv = hpcrun_sample_callpath(context, metric_id, metricIncrement,
+        0/*skipInner*/, 0/*isSync*/);
+    }
 
     blame_shift_apply(metric_id, sv.sample_node, 1 /*metricIncr*/);
+
+    // This section prints out all the LBRs for each sample. Only uncomment it when debugging
+#if 0
+    if (sample_data.lbr[0].abort == 1){
+      while (!__sync_bool_compare_and_swap(&g_hpcrun_lock, 0, 1)){ // spin lock
+        while (g_hpcrun_lock == 1);
+      }
+      fprintf(stderr, "%lx : ", (uint64_t) pc);
+      //fprintf(stderr, "%lu ", sample_data.bnr);
+      for(int index = 0; index < sample_data.bnr; index++){
+        fprintf(stderr, "%lx>%lx?%u?%u ", sample_data.lbr[index].from, sample_data.lbr[index].to, 1U & sample_data.lbr[index].in_tx, 1U & sample_data.lbr[index].abort);
+      }
+      fprintf(stderr, "\n");
+      fprintf(stderr, "=");
+      for(int i = 0; i < call_chain_number; i++){
+        fprintf(stderr, " %lx", call_chain[i]);
+      }
+      fprintf(stderr, "\n");
+      fflush(stderr);
+      __sync_synchronize();
+      g_hpcrun_lock = 0;
+    }
+#endif
+    if ( sampling_event_codes[SAMPLING_MODE_BIT_MEM_STORE] == my_event_codes[my_events[i]]
+      || sampling_event_codes[SAMPLING_MODE_BIT_MEM_LOAD] == my_event_codes[my_events[i]])
+    {
+      unsigned short isWrite;
+      if (htm_metric_mem.store_metric_id == metric_id){
+        isWrite = 1;
+      }
+      else {
+        isWrite = 0;
+      }
+      cct_metric_data_increment(htm_metric_mem.false_sharing_id, sv.sample_node, (cct_metric_data_t){.i = incrementShadowMetric(sample_data.data_addr, sample_data.tid, isWrite)});
+    }
+
+    if (sampling_event_codes[SAMPLING_MODE_BIT_CYCLE] == my_event_codes[my_events[i]])
+    {
+      unsigned int status_id = get_tsx_status(0);
+      /*if ((status_id & 0b11) == 0b11 ) {
+        cct_metric_data_increment(htm_metric_cyc.in_htm_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+      }*/
+      if (sample_data.lbr[0].abort == 1) {// Let's assume there must at least one LBR entry
+        cct_metric_data_increment(htm_metric_cyc.in_htm_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+      }
+      else if ((status_id & 0b101) == 0b101){
+        cct_metric_data_increment(htm_metric_cyc.in_fallback_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+      }
+      else if ((status_id & 0b1001) == 0b1001){
+        cct_metric_data_increment(htm_metric_cyc.in_lockwaiting_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+      }
+      else if ( (status_id & 0b1) == 0b1 ) {
+        cct_metric_data_increment(htm_metric_cyc.in_other_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+      }
+    }
+
+    if (sampling_event_codes[SAMPLING_MODE_BIT_RTM_ABORT] == my_event_codes[my_events[i]])
+    {
+      // handle the TSX-related metrics
+      // update the weight metric for the transaction
+      cct_metric_data_increment(htm_metric_abort.weight_metric_id, sv.sample_node, (cct_metric_data_t){.i = sample_data.weight});
+      // update the cause code
+      if (sample_data.tran & PERF_TXN_CONFLICT) {
+        cct_metric_data_increment(htm_metric_abort.conflict_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+        cct_metric_data_increment(htm_metric_abort.conflict_weight_metric_id, sv.sample_node, (cct_metric_data_t){.i = sample_data.weight});
+      }
+      if (sample_data.tran & PERF_TXN_CAPACITY_READ) {
+        cct_metric_data_increment(htm_metric_abort.capacity_read_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+        cct_metric_data_increment(htm_metric_abort.capacity_read_weight_metric_id, sv.sample_node, (cct_metric_data_t){.i = sample_data.weight});
+      }
+      if (sample_data.tran & PERF_TXN_CAPACITY_WRITE) {
+        cct_metric_data_increment(htm_metric_abort.capacity_write_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+        cct_metric_data_increment(htm_metric_abort.capacity_write_weight_metric_id, sv.sample_node, (cct_metric_data_t){.i = sample_data.weight});
+      }
+      if (sample_data.tran & PERF_TXN_SYNC) {
+        cct_metric_data_increment(htm_metric_abort.sync_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+        cct_metric_data_increment(htm_metric_abort.sync_weight_metric_id, sv.sample_node, (cct_metric_data_t){.i = sample_data.weight});
+      }
+      if (sample_data.tran & PERF_TXN_ASYNC) {
+        cct_metric_data_increment(htm_metric_abort.async_metric_id, sv.sample_node, (cct_metric_data_t){.i = 1});
+        cct_metric_data_increment(htm_metric_abort.async_weight_metric_id, sv.sample_node, (cct_metric_data_t){.i = sample_data.weight});
+      }
+	//fprintf(stderr, "tran = %lx\n", sample_data.tran);
+    }
   }
 
   // Add metric values for derived events by the difference in counter

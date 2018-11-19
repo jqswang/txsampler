@@ -133,6 +133,7 @@ typedef struct gpu_data_t {
 
 
 typedef struct thread_data_t {
+  void *pc;
   int idle; // indicate whether the thread is idle
 
   // ----------------------------------------

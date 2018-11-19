@@ -213,7 +213,6 @@ hpcrun_allocate_thread_data(int id)
 static inline void
 core_profile_trace_data_init(core_profile_trace_data_t * cptd, int id, cct_ctxt_t* thr_ctxt) 
 {
-
   // ----------------------------------------
   // id
   // ----------------------------------------
@@ -261,7 +260,8 @@ hpcrun_thread_data_init(int id, cct_ctxt_t* thr_ctxt, int is_child, size_t n_sou
 {
   hpcrun_meminfo_t memstore;
   thread_data_t* td = hpcrun_get_thread_data();
-
+  
+  td->pc = NULL;
   // ----------------------------------------
   // memstore for hpcrun_malloc()
   // ----------------------------------------
