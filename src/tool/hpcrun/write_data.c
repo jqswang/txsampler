@@ -282,6 +282,7 @@ write_epochs(FILE* fs, epoch_t* epoch)
 
     hpcrun_loadmap_t* current_loadmap = s->loadmap;
     
+    if (current_loadmap == NULL) return -1; //TODO(jqswang): more elegant handling
     hpcfmt_int4_fwrite(current_loadmap->size, fs);
 
     // N.B.: Write in reverse order to obtain nicely ascending LM ids.
